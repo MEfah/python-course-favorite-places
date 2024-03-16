@@ -1,7 +1,9 @@
-from fastapi import APIRouter, Depends, Query, status
+from typing import Annotated
+
+from fastapi import APIRouter, Body, Depends, Query, Request, status
 
 from exceptions import ApiHTTPException, ObjectNotFoundException
-from models.places import Place
+from models.places import Description, Place
 from schemas.places import PlaceResponse, PlacesListResponse, PlaceUpdate
 from schemas.routes import MetadataTag
 from services.places_service import PlacesService
@@ -21,6 +23,9 @@ tag_places = MetadataTag(
     response_model=PlacesListResponse,
 )
 async def get_list(
+    offset: int = Query(
+        0, gte=0, description="Количество объектов, которое необходимо пропустить"
+    ),
     limit: int = Query(
         20, gt=0, le=100, description="Ограничение на количество объектов в выборке"
     ),
@@ -34,7 +39,9 @@ async def get_list(
     :return:
     """
 
-    return PlacesListResponse(data=await places_service.get_places_list(limit=limit))
+    return PlacesListResponse(
+        data=await places_service.get_places_list(offset=offset, limit=limit)
+    )
 
 
 @router.get(
@@ -127,22 +134,36 @@ async def delete(primary_key: int, places_service: PlacesService = Depends()) ->
 
 
 @router.post(
-    "",
+    "/mylocation",
     summary="Создание нового объекта с автоматическим определением координат",
     response_model=PlaceResponse,
     status_code=status.HTTP_201_CREATED,
 )
-async def create_auto() -> PlaceResponse:
+async def create_auto(
+    request: Request,
+    description: Description,
+    places_service: PlacesService = Depends(),
+) -> PlaceResponse:
     """
     Создание нового объекта любимого места с автоматическим определением координат.
 
+    :param request: Запрос
+    :param description: Описание для текущего местоположения
+    :param places_service: Сервис для работы с информацией о любимых местах.
     :return:
     """
 
-    # Пример:
-    #
-    # import geocoder
-    # from geocoder.ipinfo import IpinfoQuery
-    #
-    # g: IpinfoQuery = geocoder.ip('me')
-    # print(g.latlng)
+    if request.client is None:
+        raise ApiHTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="IP-адрес не определён"
+        )
+
+    if primary_key := await places_service.create_place_from_ip(
+        ip=request.client.host, description=description.description
+    ):
+        return PlaceResponse(data=await places_service.get_place(primary_key))
+
+    raise ApiHTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail="Объект не был создан",
+    )

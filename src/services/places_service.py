@@ -1,7 +1,10 @@
 import logging.config
+from ipaddress import ip_address
 from typing import Optional
 
+import geocoder
 from fastapi import Depends
+from geocoder.ipinfo import IpinfoQuery
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,7 +36,7 @@ class PlacesService:
         self.session = session
         self.places_repository = PlacesRepository(session)
 
-    async def get_places_list(self, limit: int) -> list[Place]:
+    async def get_places_list(self, offset: int, limit: int) -> list[Place]:
         """
         Получение списка любимых мест.
 
@@ -41,7 +44,7 @@ class PlacesService:
         :return:
         """
 
-        return await self.places_repository.find_all_by(limit=limit)
+        return await self.places_repository.find_all_by(offset=offset, limit=limit)
 
     async def get_place(self, primary_key: int) -> Optional[Place]:
         """
@@ -62,31 +65,14 @@ class PlacesService:
         """
 
         # обогащение данных путем получения дополнительной информации от API
-        if location := await LocationClient().get_location(
-            latitude=place.latitude, longitude=place.longitude
-        ):
-            place.country = location.alpha2code
-            place.city = location.city
-            place.locality = location.locality
+        await self._fill_location_info(place)
 
         primary_key = await self.places_repository.create_model(place)
         await self.session.commit()
 
         # публикация события о создании нового объекта любимого места
         # для попытки импорта информации по нему в сервисе Countries Informer
-        try:
-            place_data = CountryCityDTO(
-                city=place.city,
-                alpha2code=place.country,
-            )
-            EventProducer().publish(
-                queue_name=settings.rabbitmq.queue.places_import, body=place_data.json()
-            )
-        except ValidationError:
-            logger.warning(
-                "The message was not well-formed during publishing event.",
-                exc_info=True,
-            )
+        await self._publish_place_event(place)
 
         return primary_key
 
@@ -99,17 +85,29 @@ class PlacesService:
         :return:
         """
 
+        new_place = Place(**place.dict())
+
         # при изменении координат – обогащение данных путем получения дополнительной информации от API
-        # todo
+        if new_place.latitude is not None or new_place.longitude is not None:
+            # Если указано только одно значение, нужно получить текущие значения
+            if not (new_place.latitude is not None and new_place.longitude is not None):
+                if current_place := await self.get_place(primary_key):
+                    if new_place.latitude is None:
+                        new_place.latitude = current_place.latitude
+
+                    if new_place.longitude is None:
+                        new_place.longitude = current_place.longitude
+
+            await self._fill_location_info(new_place)
 
         matched_rows = await self.places_repository.update_model(
-            primary_key, **place.dict(exclude_unset=True)
+            primary_key, **new_place.model_dump(exclude_unset=True)
         )
         await self.session.commit()
 
         # публикация события для попытки импорта информации
         # по обновленному объекту любимого места в сервисе Countries Informer
-        # todo
+        await self._publish_place_event(new_place)
 
         return matched_rows
 
@@ -125,3 +123,53 @@ class PlacesService:
         await self.session.commit()
 
         return matched_rows
+
+    async def create_place_from_ip(self, ip: str, description: str) -> Optional[int]:
+        """
+        Создание объекта любимого места по ip-адресу
+
+        :param ip: IP-адресс, используемый для определения локации
+        :param description: Описание любимого места
+        :return:
+        """
+
+        g: IpinfoQuery = geocoder.ip("me" if ip_address(ip).is_private else ip)
+
+        latitude, longitude = g.latlng
+
+        return await self.create_place(
+            Place(latitude=latitude, longitude=longitude, description=description)
+        )
+
+    async def _fill_location_info(self, place: Place) -> None:
+        """
+        Заполнить информацию о любимом месте через API
+
+        :param place: Объект для заполнения.
+        """
+        if location := await LocationClient().get_location(
+            latitude=place.latitude, longitude=place.longitude
+        ):
+            place.country = location.alpha2code
+            place.city = location.city
+            place.locality = location.locality
+
+    async def _publish_place_event(self, place: Place) -> None:
+        """
+        Опубликовать событие о новом месте в очередь для импорта мест RabbitMQ
+
+        :param place: Новое любимое место.
+        """
+        try:
+            place_data = CountryCityDTO(
+                city=place.city,
+                alpha2code=place.country,
+            )
+            EventProducer().publish(
+                queue_name=settings.rabbitmq.queue.places_import, body=place_data.json()
+            )
+        except ValidationError:
+            logger.warning(
+                "The message was not well-formed during publishing event.",
+                exc_info=True,
+            )
